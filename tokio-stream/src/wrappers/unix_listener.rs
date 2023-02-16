@@ -33,6 +33,9 @@ impl Stream for UnixListenerStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<io::Result<UnixStream>>> {
+        #[cfg(madsim)]
+        todo!("support `UnixListener::poll_accept` in madsim");
+        #[cfg(not(madsim))]
         match self.inner.poll_accept(cx) {
             Poll::Ready(Ok((stream, _))) => Poll::Ready(Some(Ok(stream))),
             Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err))),

@@ -33,6 +33,9 @@ impl Stream for TcpListenerStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<io::Result<TcpStream>>> {
+        #[cfg(madsim)]
+        todo!("support `TcpListener::poll_accept` in madsim");
+        #[cfg(not(madsim))]
         match self.inner.poll_accept(cx) {
             Poll::Ready(Ok((stream, _))) => Poll::Ready(Some(Ok(stream))),
             Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err))),
