@@ -4,7 +4,7 @@
 //! A [`Sender`] is used to broadcast values to **all** connected [`Receiver`]
 //! values. [`Sender`] handles are clone-able, allowing concurrent send and
 //! receive actions. [`Sender`] and [`Receiver`] are both `Send` and `Sync` as
-//! long as `T` is also `Send` or `Sync` respectively.
+//! long as `T` is `Send`.
 //!
 //! When a value is sent, **all** [`Receiver`] handles are notified and will
 //! receive the value. The value is stored once inside the channel and cloned on
@@ -53,6 +53,10 @@
 //! sent. At this point, the channel is "closed". Once a receiver has received
 //! all values retained by the channel, the next call to [`recv`] will return
 //! with [`RecvError::Closed`].
+//!
+//! When a [`Receiver`] handle is dropped, any messages not read by the receiver
+//! will be marked as read. If this receiver was the only one not to have read
+//! that message, the message will be dropped at this point.
 //!
 //! [`Sender`]: crate::sync::broadcast::Sender
 //! [`Sender::subscribe`]: crate::sync::broadcast::Sender::subscribe
@@ -114,8 +118,9 @@
 
 use crate::loom::cell::UnsafeCell;
 use crate::loom::sync::atomic::AtomicUsize;
-use crate::loom::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use crate::loom::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use crate::util::linked_list::{self, LinkedList};
+use crate::util::WakeList;
 
 use std::fmt;
 use std::future::Future;
@@ -565,12 +570,10 @@ impl<T> Sender<T> {
         // Release the slot lock before notifying the receivers.
         drop(slot);
 
-        tail.notify_rx();
-
-        // Release the mutex. This must happen after the slot lock is released,
-        // otherwise the writer lock bit could be cleared while another thread
-        // is in the critical section.
-        drop(tail);
+        // Notify and release the mutex. This must happen after the slot lock is
+        // released, otherwise the writer lock bit could be cleared while another
+        // thread is in the critical section.
+        self.shared.notify_rx(tail);
 
         Ok(rem)
     }
@@ -735,11 +738,34 @@ impl<T> Sender<T> {
         tail.rx_cnt
     }
 
+    /// Returns `true` if senders belong to the same channel.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio::sync::broadcast;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let (tx, _rx) = broadcast::channel::<()>(16);
+    ///     let tx2 = tx.clone();
+    ///
+    ///     assert!(tx.same_channel(&tx2));
+    ///
+    ///     let (tx3, _rx3) = broadcast::channel::<()>(16);
+    ///
+    ///     assert!(!tx3.same_channel(&tx2));
+    /// }
+    /// ```
+    pub fn same_channel(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
     fn close_channel(&self) {
         let mut tail = self.shared.tail.lock();
         tail.closed = true;
 
-        tail.notify_rx();
+        self.shared.notify_rx(tail);
     }
 }
 
@@ -760,18 +786,47 @@ fn new_receiver<T>(shared: Arc<Shared<T>>) -> Receiver<T> {
     Receiver { shared, next }
 }
 
-impl Tail {
-    fn notify_rx(&mut self) {
-        while let Some(mut waiter) = self.waiters.pop_back() {
-            // Safety: `waiters` lock is still held.
-            let waiter = unsafe { waiter.as_mut() };
+impl<T> Shared<T> {
+    fn notify_rx<'a, 'b: 'a>(&'b self, mut tail: MutexGuard<'a, Tail>) {
+        let mut wakers = WakeList::new();
+        'outer: loop {
+            while wakers.can_push() {
+                match tail.waiters.pop_back() {
+                    Some(mut waiter) => {
+                        // Safety: `tail` lock is still held.
+                        let waiter = unsafe { waiter.as_mut() };
 
-            assert!(waiter.queued);
-            waiter.queued = false;
+                        assert!(waiter.queued);
+                        waiter.queued = false;
 
-            let waker = waiter.waker.take().unwrap();
-            waker.wake();
+                        if let Some(waker) = waiter.waker.take() {
+                            wakers.push(waker);
+                        }
+                    }
+                    None => {
+                        break 'outer;
+                    }
+                }
+            }
+
+            // Release the lock before waking.
+            drop(tail);
+
+            // Before we acquire the lock again all sorts of things can happen:
+            // some waiters may remove themselves from the list and new waiters
+            // may be added. This is fine since at worst we will unnecessarily
+            // wake up waiters which will then queue themselves again.
+
+            wakers.wake_all();
+
+            // Acquire the lock again.
+            tail = self.tail.lock();
         }
+
+        // Release the lock before waking.
+        drop(tail);
+
+        wakers.wake_all();
     }
 }
 
@@ -860,6 +915,29 @@ impl<T> Receiver<T> {
         self.len() == 0
     }
 
+    /// Returns `true` if receivers belong to the same channel.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio::sync::broadcast;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let (tx, rx) = broadcast::channel::<()>(16);
+    ///     let rx2 = tx.subscribe();
+    ///
+    ///     assert!(rx.same_channel(&rx2));
+    ///
+    ///     let (_tx3, rx3) = broadcast::channel::<()>(16);
+    ///
+    ///     assert!(!rx3.same_channel(&rx2));
+    /// }
+    /// ```
+    pub fn same_channel(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
     /// Locks the next value if there is one.
     fn recv_ref(
         &mut self,
@@ -879,6 +957,8 @@ impl<T> Receiver<T> {
             // while `send2` acquired the `tail` lock and attempts to acquire
             // the slot lock.
             drop(slot);
+
+            let mut old_waker = None;
 
             let mut tail = self.shared.tail.lock();
 
@@ -912,7 +992,10 @@ impl<T> Receiver<T> {
                                 match (*ptr).waker {
                                     Some(ref w) if w.will_wake(waker) => {}
                                     _ => {
-                                        (*ptr).waker = Some(waker.clone());
+                                        old_waker = std::mem::replace(
+                                            &mut (*ptr).waker,
+                                            Some(waker.clone()),
+                                        );
                                     }
                                 }
 
@@ -923,6 +1006,11 @@ impl<T> Receiver<T> {
                             });
                         }
                     }
+
+                    // Drop the old waker after releasing the locks.
+                    drop(slot);
+                    drop(tail);
+                    drop(old_waker);
 
                     return Err(TryRecvError::Empty);
                 }

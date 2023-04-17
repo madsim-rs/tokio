@@ -68,7 +68,7 @@ impl RuntimeMetrics {
         self.handle.inner.num_blocking_threads()
     }
 
-    /// Returns the number of idle threads, which hve spawned by the runtime
+    /// Returns the number of idle threads, which have spawned by the runtime
     /// for `spawn_blocking` calls.
     ///
     /// # Examples
@@ -121,6 +121,21 @@ impl RuntimeMetrics {
             .inner
             .scheduler_metrics()
             .remote_schedule_count
+            .load(Relaxed)
+    }
+
+    /// Returns the number of times that tasks have been forced to yield back to the scheduler
+    /// after exhausting their task budgets.
+    ///
+    /// This count starts at zero when the runtime is created and increases by one each time a task yields due to exhausting its budget.
+    ///
+    /// The counter is monotonically increasing. It is never decremented or
+    /// reset to zero.
+    pub fn budget_forced_yield_count(&self) -> u64 {
+        self.handle
+            .inner
+            .scheduler_metrics()
+            .budget_forced_yield_count
             .load(Relaxed)
     }
 

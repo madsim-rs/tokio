@@ -21,7 +21,7 @@ env:
   # - tokio-util/Cargo.toml
   # - tokio-test/Cargo.toml
   # - tokio-stream/Cargo.toml
-  rust_min: 1.49.0
+  rust_min: 1.56.0
 
 defaults:
   run:
@@ -31,7 +31,7 @@ permissions:
   contents: read
 
 jobs:
-  # Depends on all action sthat are required for a "successful" CI run.
+  # Depends on all actions that are required for a "successful" CI run.
   tests-pass:
     name: all systems go
     runs-on: ubuntu-latest
@@ -62,7 +62,20 @@ jobs:
     steps:
       - run: exit 0
 
+  # Basic actions that must pass before we kick off more expensive tests.
+  basics:
+    name: basic checks
+    runs-on: ubuntu-latest
+    needs:
+      - clippy
+      - fmt
+      - docs
+      - minrust
+    steps:
+      - run: exit 0
+
   test:
+    needs: basics
     name: test tokio full
     runs-on: ${{ matrix.os }}
     strategy:
@@ -119,6 +132,7 @@ jobs:
     # This relies on the potentially affected Tokio type being listed in
     # `tokio/tokio/tests/async_send_sync.rs`.
     name: compile tests with parking lot send guards
+    needs: basics
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -135,6 +149,7 @@ jobs:
 
   valgrind:
     name: valgrind
+    needs: basics
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -167,6 +182,7 @@ jobs:
 
   test-unstable:
     name: test tokio full --unstable
+    needs: basics
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -193,6 +209,7 @@ jobs:
 
   miri:
     name: miri
+    needs: basics
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -209,10 +226,10 @@ jobs:
         working-directory: tokio
         env:
           MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-retag-fields
-          PROPTEST_CASES: 10
 
   asan:
     name: asan
+    needs: basics
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -233,6 +250,7 @@ jobs:
 
   semver:
     name: semver
+    needs: basics
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -246,16 +264,11 @@ jobs:
           tool: cargo-semver-checks
       - name: Check semver compatibility
         run: |
-          cargo semver-checks check-release \
-              --release-type minor \
-              --exclude benches \
-              --exclude examples \
-              --exclude stress-test \
-              --exclude tests-build \
-              --exclude tests-integration
+          cargo semver-checks check-release --release-type minor
 
   cross-check:
     name: cross-check
+    needs: basics
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -280,6 +293,7 @@ jobs:
 
   cross-test:
     name: cross-test
+    needs: basics
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -316,6 +330,7 @@ jobs:
   # See https://github.com/tokio-rs/tokio/issues/5187
   no-atomic-u64:
     name: Test i686-unknown-linux-gnu without AtomicU64
+    needs: basics
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -344,6 +359,7 @@ jobs:
 
   features:
     name: features
+    needs: basics
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -393,6 +409,7 @@ jobs:
 
   minimal-versions:
     name: minimal-versions
+    needs: basics
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -475,6 +492,7 @@ jobs:
 
   loom-compile:
     name: build loom tests
+    needs: basics
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -503,6 +521,7 @@ jobs:
 
   test-hyper:
     name: Test hyper
+    needs: basics
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -536,6 +555,7 @@ jobs:
 
   x86_64-fortanix-unknown-sgx:
     name: build tokio for x86_64-fortanix-unknown-sgx
+    needs: basics
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -552,6 +572,7 @@ jobs:
 
   wasm32-unknown-unknown:
     name: test tokio for wasm32-unknown-unknown
+    needs: basics
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -568,6 +589,7 @@ jobs:
 
   wasm32-wasi:
     name: wasm32-wasi
+    needs: basics
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -615,6 +637,7 @@ jobs:
 
   check-external-types:
     name: check-external-types
+    needs: basics
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
