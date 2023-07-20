@@ -209,7 +209,7 @@ pub fn main(args: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Marks async function to be executed by selected runtime. This macro helps set up a `Runtime`
 /// without requiring the user to use [Runtime](../tokio/runtime/struct.Runtime.html) or
-/// [Builder](../tokio/runtime/struct.builder.html) directly.
+/// [Builder](../tokio/runtime/struct.Builder.html) directly.
 ///
 /// ## Function arguments:
 ///
@@ -295,8 +295,7 @@ pub fn main_rt(args: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 ///
 /// The `worker_threads` option configures the number of worker threads, and
-/// defaults to the number of cpus on the system. This is the default
-/// flavor.
+/// defaults to the number of cpus on the system.
 ///
 /// Note: The multi-threaded runtime requires the `rt-multi-thread` feature
 /// flag.
