@@ -4,9 +4,9 @@ name = "tokio-stream"
 # - Remove path dependencies
 # - Update CHANGELOG.md.
 # - Create "tokio-stream-0.1.x" git tag.
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
-rust-version = "1.56"
+rust-version = "1.63"
 authors = ["Tokio Contributors <team@tokio.rs>"]
 license = "MIT"
 repository = "https://github.com/tokio-rs/tokio"
@@ -37,7 +37,7 @@ signal = ["tokio/signal"]
 
 [dependencies]
 futures-core = { version = "0.3.0" }
-pin-project-lite = "0.2.7"
+pin-project-lite = "0.2.11"
 tokio = { version = "0.2", package = "madsim-tokio", features = ["sync"] }
 tokio-util = { version = "0.7.0", optional = true }
 

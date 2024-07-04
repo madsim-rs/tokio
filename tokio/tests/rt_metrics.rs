@@ -1,8 +1,14 @@
+#![allow(unknown_lints, unexpected_cfgs)]
 #![warn(rust_2018_idioms)]
-#![cfg(all(feature = "full", tokio_unstable, not(tokio_wasi)))]
+#![cfg(all(
+    feature = "full",
+    tokio_unstable,
+    not(target_os = "wasi"),
+    target_has_atomic = "64"
+))]
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::task::Poll;
 use tokio::macros::support::poll_fn;
 
@@ -22,6 +28,11 @@ fn num_workers() {
 #[test]
 fn num_blocking_threads() {
     let rt = current_thread();
+    assert_eq!(0, rt.metrics().num_blocking_threads());
+    let _ = rt.block_on(rt.spawn_blocking(move || {}));
+    assert_eq!(1, rt.metrics().num_blocking_threads());
+
+    let rt = threaded();
     assert_eq!(0, rt.metrics().num_blocking_threads());
     let _ = rt.block_on(rt.spawn_blocking(move || {}));
     assert_eq!(1, rt.metrics().num_blocking_threads());
@@ -82,20 +93,60 @@ fn blocking_queue_depth() {
 }
 
 #[test]
-fn active_tasks_count() {
+fn num_alive_tasks() {
     let rt = current_thread();
     let metrics = rt.metrics();
-    assert_eq!(0, metrics.active_tasks_count());
-    rt.spawn(async move {
-        assert_eq!(1, metrics.active_tasks_count());
-    });
+    assert_eq!(0, metrics.num_alive_tasks());
+    rt.block_on(rt.spawn(async move {
+        assert_eq!(1, metrics.num_alive_tasks());
+    }))
+    .unwrap();
+
+    assert_eq!(0, rt.metrics().num_alive_tasks());
 
     let rt = threaded();
     let metrics = rt.metrics();
-    assert_eq!(0, metrics.active_tasks_count());
-    rt.spawn(async move {
-        assert_eq!(1, metrics.active_tasks_count());
-    });
+    assert_eq!(0, metrics.num_alive_tasks());
+    rt.block_on(rt.spawn(async move {
+        assert_eq!(1, metrics.num_alive_tasks());
+    }))
+    .unwrap();
+
+    // try for 10 seconds to see if this eventually succeeds.
+    // wake_join() is called before the task is released, so in multithreaded
+    // code, this means we sometimes exit the block_on before the counter decrements.
+    for _ in 0..100 {
+        if rt.metrics().num_alive_tasks() == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(0, rt.metrics().num_alive_tasks());
+}
+
+#[test]
+fn spawned_tasks_count() {
+    let rt = current_thread();
+    let metrics = rt.metrics();
+    assert_eq!(0, metrics.spawned_tasks_count());
+
+    rt.block_on(rt.spawn(async move {
+        assert_eq!(1, metrics.spawned_tasks_count());
+    }))
+    .unwrap();
+
+    assert_eq!(1, rt.metrics().spawned_tasks_count());
+
+    let rt = threaded();
+    let metrics = rt.metrics();
+    assert_eq!(0, metrics.spawned_tasks_count());
+
+    rt.block_on(rt.spawn(async move {
+        assert_eq!(1, metrics.spawned_tasks_count());
+    }))
+    .unwrap();
+
+    assert_eq!(1, rt.metrics().spawned_tasks_count());
 }
 
 #[test]
@@ -175,13 +226,14 @@ fn worker_noop_count() {
 }
 
 #[test]
+#[ignore] // this test is flaky, see https://github.com/tokio-rs/tokio/issues/6470
 fn worker_steal_count() {
     // This metric only applies to the multi-threaded runtime.
     //
     // We use a blocking channel to backup one worker thread.
     use std::sync::mpsc::channel;
 
-    let rt = threaded();
+    let rt = threaded_no_lifo();
     let metrics = rt.metrics();
 
     rt.block_on(async {
@@ -190,13 +242,11 @@ fn worker_steal_count() {
         // Move to the runtime.
         tokio::spawn(async move {
             // Spawn the task that sends to the channel
+            //
+            // Since the lifo slot is disabled, this task is stealable.
             tokio::spawn(async move {
                 tx.send(()).unwrap();
             });
-
-            // Spawn a task that bumps the previous task out of the "next
-            // scheduled" slot.
-            tokio::spawn(async {});
 
             // Blocking receive on the channel.
             rx.recv().unwrap();
@@ -215,18 +265,25 @@ fn worker_steal_count() {
 }
 
 #[test]
-fn worker_poll_count() {
+fn worker_poll_count_and_time() {
     const N: u64 = 5;
+
+    async fn task() {
+        // Sync sleep
+        std::thread::sleep(std::time::Duration::from_micros(10));
+    }
 
     let rt = current_thread();
     let metrics = rt.metrics();
     rt.block_on(async {
         for _ in 0..N {
-            tokio::spawn(async {}).await.unwrap();
+            tokio::spawn(task()).await.unwrap();
         }
     });
     drop(rt);
     assert_eq!(N, metrics.worker_poll_count(0));
+    // Not currently supported for current-thread runtime
+    assert_eq!(Duration::default(), metrics.worker_mean_poll_time(0));
 
     // Does not populate the histogram
     assert!(!metrics.poll_count_histogram_enabled());
@@ -238,7 +295,7 @@ fn worker_poll_count() {
     let metrics = rt.metrics();
     rt.block_on(async {
         for _ in 0..N {
-            tokio::spawn(async {}).await.unwrap();
+            tokio::spawn(task()).await.unwrap();
         }
     });
     drop(rt);
@@ -248,6 +305,12 @@ fn worker_poll_count() {
         .sum();
 
     assert_eq!(N, n);
+
+    let n: Duration = (0..metrics.num_workers())
+        .map(|i| metrics.worker_mean_poll_time(i))
+        .sum();
+
+    assert!(n > Duration::default());
 
     // Does not populate the histogram
     assert!(!metrics.poll_count_histogram_enabled());
@@ -458,13 +521,16 @@ fn worker_overflow_count() {
 
             // First, we need to block the other worker until all tasks have
             // been spawned.
-            tokio::spawn(async move {
-                tx1.send(()).unwrap();
-                rx2.recv().unwrap();
+            //
+            // We spawn from outside the runtime to ensure that the other worker
+            // will pick it up:
+            // <https://github.com/tokio-rs/tokio/issues/4730>
+            tokio::task::spawn_blocking(|| {
+                tokio::spawn(async move {
+                    tx1.send(()).unwrap();
+                    rx2.recv().unwrap();
+                });
             });
-
-            // Bump the next-run spawn
-            tokio::spawn(async {});
 
             rx1.recv().unwrap();
 
@@ -488,7 +554,7 @@ fn worker_overflow_count() {
 }
 
 #[test]
-fn injection_queue_depth() {
+fn injection_queue_depth_current_thread() {
     use std::thread;
 
     let rt = current_thread();
@@ -502,44 +568,34 @@ fn injection_queue_depth() {
     .unwrap();
 
     assert_eq!(1, metrics.injection_queue_depth());
+}
 
+#[test]
+fn injection_queue_depth_multi_thread() {
     let rt = threaded();
-    let handle = rt.handle().clone();
     let metrics = rt.metrics();
 
-    // First we need to block the runtime workers
-    let (tx1, rx1) = std::sync::mpsc::channel();
-    let (tx2, rx2) = std::sync::mpsc::channel();
-    let (tx3, rx3) = std::sync::mpsc::channel();
-    let rx3 = Arc::new(Mutex::new(rx3));
+    let barrier1 = Arc::new(Barrier::new(3));
+    let barrier2 = Arc::new(Barrier::new(3));
 
-    rt.spawn(async move { rx1.recv().unwrap() });
-    rt.spawn(async move { rx2.recv().unwrap() });
-
-    // Spawn some more to make sure there are items
-    for _ in 0..10 {
-        let rx = rx3.clone();
+    // Spawn a task per runtime worker to block it.
+    for _ in 0..2 {
+        let barrier1 = barrier1.clone();
+        let barrier2 = barrier2.clone();
         rt.spawn(async move {
-            rx.lock().unwrap().recv().unwrap();
+            barrier1.wait();
+            barrier2.wait();
         });
     }
 
-    thread::spawn(move || {
-        handle.spawn(async {});
-    })
-    .join()
-    .unwrap();
+    barrier1.wait();
 
-    let n = metrics.injection_queue_depth();
-    assert!(1 <= n, "{}", n);
-    assert!(15 >= n, "{}", n);
-
-    for _ in 0..10 {
-        tx3.send(()).unwrap();
+    for i in 0..10 {
+        assert_eq!(i, metrics.injection_queue_depth());
+        rt.spawn(async {});
     }
 
-    tx1.send(()).unwrap();
-    tx2.send(()).unwrap();
+    barrier2.wait();
 }
 
 #[test]
@@ -708,6 +764,15 @@ fn current_thread() -> Runtime {
 fn threaded() -> Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+fn threaded_no_lifo() -> Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .disable_lifo_slot()
         .enable_all()
         .build()
         .unwrap()

@@ -1,10 +1,11 @@
+#![allow(unknown_lints, unexpected_cfgs)]
 #![cfg(feature = "macros")]
 #![allow(clippy::disallowed_names)]
 
-#[cfg(tokio_wasm_not_wasi)]
+#[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
 use wasm_bindgen_test::wasm_bindgen_test as maybe_tokio_test;
 
-#[cfg(not(tokio_wasm_not_wasi))]
+#[cfg(not(all(target_family = "wasm", not(target_os = "wasi"))))]
 use tokio::test as maybe_tokio_test;
 
 use tokio::sync::oneshot;
@@ -17,6 +18,25 @@ use std::task::Poll::Ready;
 async fn sync_one_lit_expr_comma() {
     let foo = tokio::select! {
         foo = async { 1 } => foo,
+    };
+
+    assert_eq!(foo, 1);
+}
+
+#[maybe_tokio_test]
+async fn no_branch_else_only() {
+    let foo = tokio::select! {
+        else => 1,
+    };
+
+    assert_eq!(foo, 1);
+}
+
+#[maybe_tokio_test]
+async fn no_branch_else_only_biased() {
+    let foo = tokio::select! {
+        biased;
+        else => 1,
     };
 
     assert_eq!(foo, 1);
@@ -633,7 +653,7 @@ mod unstable {
     }
 
     #[test]
-    #[cfg(all(feature = "rt-multi-thread", not(tokio_wasi)))]
+    #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
     fn deterministic_select_multi_thread() {
         let seed = b"bytes used to generate seed";
         let rt1 = tokio::runtime::Builder::new_multi_thread()
